@@ -1597,14 +1597,18 @@ function buildMasked(src, defs) {
     };
     t = t.replace(REFLINK_SEARCH_RE, maskRef);
   }
-  t = t.replace(ANY_PUNCT_OUTSIDE_CODE_RE, (m, s, r) =>
-    r ? '+'.repeat(m.length)
-      : s ? s + m.slice(s.length, m.length - s.length).replace(/`/g, '+') + s
-        : m);
-  t = t.replace(BLOCK_SKIP_RE, (m, p1, p2) => {
-    const o = p2 ? p2.length : 0;
-    return m.slice(0, o) + '[' + 'a'.repeat(Math.max(0, m.length - o - 2)) + ']';
-  });
+  if (src.includes('\\') || src.includes('`')) {
+    t = t.replace(ANY_PUNCT_OUTSIDE_CODE_RE, (m, s, r) =>
+      r ? '+'.repeat(m.length)
+        : s ? s + m.slice(s.length, m.length - s.length).replace(/`/g, '+') + s
+          : m);
+  }
+  if (t.includes('[') || t.includes('`') || t.includes('<')) {
+    t = t.replace(BLOCK_SKIP_RE, (m, p1, p2) => {
+      const o = p2 ? p2.length : 0;
+      return m.slice(0, o) + '[' + 'a'.repeat(Math.max(0, m.length - o - 2)) + ']';
+    });
+  }
   return t;
 }
 
@@ -1613,29 +1617,39 @@ function buildMasked(src, defs) {
 // can never be closers). Mirrors the reference lexer's index computation.
 function computeLastCloser(masked) {
   const res = { '*': -1, '_': -1, '~': -1 };
-  const n = masked.length;
-  for (let s = 0; s < n; s++) {
-    const r = masked[s];
-    if (r !== '*' && r !== '_' && r !== '~') continue;
-    const o = s === 0 ? '\n' : masked[s - 1];
-    let i = s + 1;
-    while (i < n && masked[i] === r) i++;
-    if (o !== ' ' && o !== '\t' && o !== '\n' && o !== '\r' && o !== '\f') res[r] = s;
-    s = i - 1;
+  // Scan from the end: the first valid run found per character is its
+  // last one, so most segments stop early.
+  let remaining = 3;
+  let j = masked.length - 1;
+  while (j >= 0 && remaining > 0) {
+    const r = masked[j];
+    if ((r === '*' || r === '_' || r === '~') && res[r] === -1) {
+      let s = j;
+      while (s > 0 && masked[s - 1] === r) s--;
+      const o = s === 0 ? '\n' : masked[s - 1];
+      if (o !== ' ' && o !== '\t' && o !== '\n' && o !== '\r' && o !== '\f') {
+        res[r] = s;
+        remaining--;
+      }
+      j = s - 1;
+    } else {
+      j--;
+    }
   }
   return res;
 }
 
-// Try to form an em/strong token at the start of src (src is the
-// remaining original text; maskInfo describes the whole segment).
-// Returns {len, kind, content} or null.
-function tryEmStrong(src, maskInfo, prevChar) {
-  const m = EM_LD_RE.exec(src);
+// Try to form an em/strong token at offset i0 of s (maskInfo describes
+// the whole of s). Returns {len, kind, content} or null.
+function tryEmStrong(s, i0, maskInfo, prevChar) {
+  const r = s[i0];
+  let runLen = 1;
+  while (s[i0 + runLen] === r) runLen++;
+  const m = EM_LD_RE.exec(s.slice(i0, i0 + runLen + 8));
   if (!m || (!m[1] && !m[2] && !m[3] && !m[4])) return null;
-  const r = m[0][0];
   const sameChar = prevChar === r;
   const full = maskInfo.masked;
-  const off = full.length - src.length;
+  const off = i0;
   let l = off;
   while (l > 0 && full[l - 1] === r) l--;
   let p = '';
@@ -1655,7 +1669,7 @@ function tryEmStrong(src, maskInfo, prevChar) {
   const v = maskInfo.closers[r];
   const q = off + k;
   if (v < q) return null;
-  const t = full.slice(off + k);
+  const t = full.slice(q);
   const ee = v - q;
   const RD = r === '*' ? EM_RD_AST_RE : EM_RD_UND_RE;
   RD.lastIndex = 0;
@@ -1674,26 +1688,26 @@ function tryEmStrong(src, maskInfo, prevChar) {
     const bb = Math.min(b, b + need + f);
     const te = [...sm[0]][0].length;
     const rawLen = k + sm.index + te + bb;
-    const raw = src.slice(0, rawLen);
+    const raw = s.slice(i0, i0 + rawLen);
     if (Math.min(k, bb) % 2) return { len: rawLen, kind: 'em', content: raw.slice(1, -1) };
     return { len: rawLen, kind: 'strong', content: raw.slice(2, -2) };
   }
   return null;
 }
 
-// Try to form a del token at the start of src. Returns {len, content}
+// Try to form a del token at offset i0 of s. Returns {len, content}
 // or null.
-function tryDel(src, maskInfo, prevChar) {
-  const m = DEL_LD_RE.exec(src);
+function tryDel(s, i0, maskInfo, prevChar) {
+  const m = DEL_LD_RE.exec(s.slice(i0, i0 + 8));
   if (!m) return null;
   if (!(!(m[1] || '') || !prevChar || PUNCT_NT_RE.test(prevChar))) return null;
   const o = [...m[0]].length - 1;
   let need = o;
   const full = maskInfo.masked;
   const u = maskInfo.closers['~'];
-  const d = full.length - src.length + o;
+  const d = i0 + o;
   if (u < d) return null;
-  const t = full.slice(full.length - src.length + o);
+  const t = full.slice(d);
   const kk = u - d;
   DEL_RD_RE.lastIndex = 0;
   let sm;
@@ -1708,7 +1722,7 @@ function tryDel(src, maskInfo, prevChar) {
     const ll = Math.min(len, len + need);
     const gg = [...sm[0]][0].length;
     const rawLen = o + sm.index + gg + ll;
-    const raw = src.slice(0, rawLen);
+    const raw = s.slice(i0, i0 + rawLen);
     return { len: rawLen, content: raw.slice(o, rawLen - o) };
   }
   return null;
@@ -1987,7 +2001,7 @@ function parseInlineNodes(text, defs) {
         flush();
         const pc = textSince ? rPrev : '';
         if (c === '~') {
-          const att = tryDel(s.slice(i), maskInfo, pc);
+          const att = tryDel(s, i, maskInfo, pc);
           if (att) {
             nodes.push({ k: 'del', children: parseInlineNodes(att.content, defs) });
             textSince = false;
@@ -1999,7 +2013,7 @@ function parseInlineNodes(text, defs) {
           i += run;
           continue;
         }
-        const att = tryEmStrong(s.slice(i), maskInfo, pc);
+        const att = tryEmStrong(s, i, maskInfo, pc);
         if (att) {
           nodes.push({ k: att.kind, children: parseInlineNodes(att.content, defs) });
           textSince = false;
@@ -2023,7 +2037,7 @@ function parseInlineNodes(text, defs) {
           flush();
           const pc = textSince ? rPrev : '';
           if (c === '~') {
-            const att = tryDel(s.slice(i), maskInfo, pc);
+            const att = tryDel(s, i, maskInfo, pc);
             if (att) {
               nodes.push({ k: 'del', children: parseInlineNodes(att.content, defs) });
               textSince = false;
@@ -2034,7 +2048,7 @@ function parseInlineNodes(text, defs) {
             i += run;
             continue;
           }
-          const att = tryEmStrong(s.slice(i), maskInfo, pc);
+          const att = tryEmStrong(s, i, maskInfo, pc);
           if (att) {
             nodes.push({ k: att.kind, children: parseInlineNodes(att.content, defs) });
             textSince = false;
@@ -2261,9 +2275,10 @@ const SCHEME_RE = /^(?:https?|ftp):\/\//i;
 // Extended email autolink: a local part of symbol-ish characters, then a
 // domain of dot-separated segments (at least one dot). A candidate that
 // ends in '-' or '_' is not a link at all.
-const EMAIL_RE = /^[A-Za-z0-9.!#$%&'*+\-=?^_`{|}~]+@[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+/;
+const EMAIL_RE = /[A-Za-z0-9.!#$%&'*+\-=?^_`{|}~]+@[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+/y;
 function matchEmail(text, i) {
-  const m = EMAIL_RE.exec(text.slice(i));
+  EMAIL_RE.lastIndex = i;
+  const m = EMAIL_RE.exec(text);
   if (!m) return null;
   const last = m[0][m[0].length - 1];
   if (last === '-' || last === '_') return null;
@@ -2326,11 +2341,10 @@ function linkifyText(text) {
     const c = text[i];
     const prevOk = i === 0 || !/[A-Za-z0-9/@]/.test(text[i - 1]);
     if (prevOk && (c === 'w' || c === 'h' || c === 'H' || c === 'f' || c === 'F')) {
-      const rest = text.slice(i);
       let url = null;
       let isWww = false;
-      if (WWW_RE.test(rest)) isWww = true;
-      if (isWww || SCHEME_RE.test(rest)) {
+      if (c === 'w' && text.startsWith('www.', i) && /[A-Za-z0-9]/.test(text[i + 4] ?? '')) isWww = true;
+      if (isWww || /^(?:https?|ftp):\/\//i.test(text.slice(i, i + 8))) {
         let j = i;
         while (j < n && !/[\s<]/.test(text[j])) j++;
         url = trimAutolink(text.slice(i, j));
@@ -2347,8 +2361,8 @@ function linkifyText(text) {
     }
     // mailto:/xmpp: prefixed forms: the whole thing becomes the link.
     if (prevOk && (c === 'm' || c === 'x')) {
-      const rest = text.slice(i);
-      const pm = /^(mailto|xmpp):/.exec(rest);
+      const pm = text.startsWith('mailto:', i) ? ['mailto:', 'mailto']
+        : text.startsWith('xmpp:', i) ? ['xmpp:', 'xmpp'] : null;
       if (pm) {
         const em = matchEmail(text, i + pm[0].length);
         if (em) {
