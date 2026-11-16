@@ -424,10 +424,11 @@ function tokList(lex, src) {
     if (!(m = itemRe.exec(rest)) || B.hr.test(rest)) break;
     const itemStart = consumed();
     rest = rest.substring(m[0].length);
-    const firstLine = m[2].split('\n', 1)[0];
+    const firstLine = m[2].endsWith('\n') ? m[2].slice(0, -1) : m[2];
     const bulletWidth = m[1].length;
     let content = firstLine.replace(O.leadingSpaceTab, (v) => expandTabs(v, bulletWidth));
-    let nextLine = rest.split('\n', 1)[0];
+    const nl0 = rest.indexOf('\n');
+    let nextLine = nl0 === -1 ? rest : rest.slice(0, nl0);
     const blankItem = !content.trim();
     let indent;
     if (blankItem) {
@@ -451,9 +452,12 @@ function tokList(lex, src) {
       const quoteAtIndent = indentRegex(indent, 'blockquoteBegin');
       let lineBlank = blankItem;
       while (rest) {
-        const line = rest.split('\n', 1)[0];
+        const nl = rest.indexOf('\n');
+        const line = nl === -1 ? rest : rest.slice(0, nl);
         nextLine = line;
-        const expanded = line.replace(O.leadingSpaceTab, (v) => expandTabs(v));
+        const firstCode = line.charCodeAt(0);
+        const expanded =
+          firstCode === 32 || firstCode === 9 ? line.replace(O.leadingSpaceTab, (v) => expandTabs(v)) : line;
         if (
           fencesAtIndent.test(line) ||
           headingAtIndent.test(line) ||
@@ -469,7 +473,7 @@ function tokList(lex, src) {
         } else {
           if (
             lineBlank ||
-            content.replace(/\t/g, '    ').search(O.nonSpaceChar) >= 4 ||
+            (content.includes('\t') ? content.replace(/\t/g, '    ') : content).search(O.nonSpaceChar) >= 4 ||
             fencesAtIndent.test(content) ||
             headingAtIndent.test(content) ||
             htmlAtIndent.test(content) ||
@@ -865,22 +869,32 @@ function tokReflink(lex, src) {
 
 // Last index at which each emphasis delimiter could still close, found by
 // scanning the masked text: a run whose preceding character is not
-// whitespace can close.
+// whitespace can close. Scanning backwards lets us stop as soon as the
+// last run of every delimiter kind has been found.
 function scanMaskInfo(masked) {
   const lastEm = { '*': -1, '_': -1 };
   let lastDel = -1;
-  const n = masked.length;
-  for (let i = 0; i < n; i++) {
+  let found = 0;
+  let i = masked.length - 1;
+  while (i >= 0 && found < 3) {
     const c = masked.charAt(i);
-    if (c !== '*' && c !== '_' && c !== '~') continue;
-    const prev = i === 0 ? '\n' : masked.charAt(i - 1);
-    let j = i + 1;
-    while (j < n && masked.charAt(j) === c) j++;
-    if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') {
-      if (c === '~') lastDel = i;
-      else lastEm[c] = i;
+    if (c !== '*' && c !== '_' && c !== '~') {
+      i--;
+      continue;
     }
-    i = j - 1;
+    let j = i;
+    while (j >= 0 && masked.charAt(j) === c) j--;
+    const start = j + 1;
+    const already = c === '~' ? lastDel !== -1 : lastEm[c] !== -1;
+    if (!already) {
+      const prev = start === 0 ? '\n' : masked.charAt(start - 1);
+      if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') {
+        if (c === '~') lastDel = start;
+        else lastEm[c] = start;
+        found++;
+      }
+    }
+    i = j;
   }
   return { lastEm, lastDel };
 }
@@ -1072,15 +1086,21 @@ function maskSrc(lex, src) {
     };
     masked = masked.replace(I.reflinkSearch, collapseRef);
   }
-  masked = masked.replace(I.anyPunctuationOutsideCode, (match, codeRun, punct) => {
-    if (punct) return '+'.repeat(match.length);
-    if (codeRun) return codeRun + match.slice(codeRun.length, -codeRun.length).replace(/`/g, '+') + codeRun;
-    return match;
-  });
-  masked = masked.replace(I.blockSkip, (match, g1, g2) => {
-    const keep = g2 ? g2.length : 0;
-    return `${match.slice(0, keep)}[${'a'.repeat(match.length - keep - 2)}]`;
-  });
+  // The punctuation pass can only change something when a backslash or a
+  // backtick is present; the block-skip pass additionally needs '[' or '<'.
+  if (src.includes('\\') || src.includes('`')) {
+    masked = masked.replace(I.anyPunctuationOutsideCode, (match, codeRun, punct) => {
+      if (punct) return '+'.repeat(match.length);
+      if (codeRun) return codeRun + match.slice(codeRun.length, -codeRun.length).replace(/`/g, '+') + codeRun;
+      return match;
+    });
+  }
+  if (src.includes('[') || src.includes('`') || src.includes('<')) {
+    masked = masked.replace(I.blockSkip, (match, g1, g2) => {
+      const keep = g2 ? g2.length : 0;
+      return `${match.slice(0, keep)}[${'a'.repeat(match.length - keep - 2)}]`;
+    });
+  }
   return masked;
 }
 
@@ -1112,57 +1132,85 @@ function inlineTokensInner(lex, src, tokens) {
     else throw new Error(`Infinite loop on byte: ${src.charCodeAt(0)}`);
     if (!keepPrevChar) prevChar = '';
     keepPrevChar = false;
+    // Every tokenizer except text/url is anchored to a distinctive first
+    // character, so most attempts can be skipped by dispatching on it.
+    // The relative order of the attempts that remain is marked's order.
+    const c = src.charCodeAt(0);
     let tok;
-    if ((tok = tokEscape(src))) {
-      src = src.substring(tok.raw.length);
-      tokens.push(tok);
-      continue;
+    if (c === 92) {
+      // backslash
+      if ((tok = tokEscape(src))) {
+        src = src.substring(tok.raw.length);
+        tokens.push(tok);
+        continue;
+      }
+      if ((tok = tokBr(src))) {
+        src = src.substring(tok.raw.length);
+        tokens.push(tok);
+        continue;
+      }
+    } else if (c === 60) {
+      // '<'
+      if ((tok = tokTag(lex, src))) {
+        src = src.substring(tok.raw.length);
+        tokens.push(tok);
+        continue;
+      }
+      if ((tok = tokAutolink(src))) {
+        src = src.substring(tok.raw.length);
+        tokens.push(tok);
+        continue;
+      }
+    } else if (c === 91 || c === 33) {
+      // '[' or '!'
+      if ((tok = tokLink(lex, src))) {
+        src = src.substring(tok.raw.length);
+        tokens.push(tok);
+        continue;
+      }
+      if ((tok = tokReflink(lex, src))) {
+        src = src.substring(tok.raw.length);
+        const prev = tokens[tokens.length - 1];
+        if (tok.type === 'text' && prev && prev.type === 'text') {
+          prev.raw += tok.raw;
+          prev.text += tok.text;
+        } else tokens.push(tok);
+        continue;
+      }
+    } else if (c === 42 || c === 95) {
+      // '*' or '_'
+      if ((tok = tokEmStrong(lex, src, masked, maskInfo, prevChar))) {
+        src = src.substring(tok.raw.length);
+        tokens.push(tok);
+        continue;
+      }
+    } else if (c === 96) {
+      // '`'
+      if ((tok = tokCodespan(src))) {
+        src = src.substring(tok.raw.length);
+        tokens.push(tok);
+        continue;
+      }
+    } else if (c === 32) {
+      // ' '
+      if ((tok = tokBr(src))) {
+        src = src.substring(tok.raw.length);
+        tokens.push(tok);
+        continue;
+      }
+    } else if (c === 126) {
+      // '~'
+      if ((tok = tokDel(lex, src, masked, maskInfo, prevChar))) {
+        src = src.substring(tok.raw.length);
+        tokens.push(tok);
+        continue;
+      }
     }
-    if ((tok = tokTag(lex, src))) {
-      src = src.substring(tok.raw.length);
-      tokens.push(tok);
-      continue;
-    }
-    if ((tok = tokLink(lex, src))) {
-      src = src.substring(tok.raw.length);
-      tokens.push(tok);
-      continue;
-    }
-    if ((tok = tokReflink(lex, src))) {
-      src = src.substring(tok.raw.length);
-      const prev = tokens[tokens.length - 1];
-      if (tok.type === 'text' && prev && prev.type === 'text') {
-        prev.raw += tok.raw;
-        prev.text += tok.text;
-      } else tokens.push(tok);
-      continue;
-    }
-    if ((tok = tokEmStrong(lex, src, masked, maskInfo, prevChar))) {
-      src = src.substring(tok.raw.length);
-      tokens.push(tok);
-      continue;
-    }
-    if ((tok = tokCodespan(src))) {
-      src = src.substring(tok.raw.length);
-      tokens.push(tok);
-      continue;
-    }
-    if ((tok = tokBr(src))) {
-      src = src.substring(tok.raw.length);
-      tokens.push(tok);
-      continue;
-    }
-    if ((tok = tokDel(lex, src, masked, maskInfo, prevChar))) {
-      src = src.substring(tok.raw.length);
-      tokens.push(tok);
-      continue;
-    }
-    if ((tok = tokAutolink(src))) {
-      src = src.substring(tok.raw.length);
-      tokens.push(tok);
-      continue;
-    }
-    if (!lex.state.inLink && (tok = tokUrl(src))) {
+    if (
+      !lex.state.inLink &&
+      ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 46 || c === 95 || c === 43 || c === 45) &&
+      (tok = tokUrl(src))
+    ) {
       src = src.substring(tok.raw.length);
       tokens.push(tok);
       continue;
